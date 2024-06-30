@@ -7,7 +7,7 @@ use std::ffi::OsString;
 
 use crate::cli::{AuthType, Cli, HttpVersion, Verify};
 use crate::request_items::{Body, RequestItem, FORM_CONTENT_TYPE, JSON_ACCEPT, JSON_CONTENT_TYPE};
-use crate::utils::url_with_query;
+use crate::utils::{url_with_query, HeaderValueExt};
 
 pub fn print_curl_translation(args: Cli) -> Result<()> {
     let cmd = translate(args)?;
@@ -92,8 +92,6 @@ pub fn translate(args: Cli) -> Result<Command> {
         (args.body, "-b/--body"),
         // No straightforward equivalent
         (args.print.is_some(), "-p/--print"),
-        // No equivalent, -s/--silent suppresses other stuff
-        (args.quiet, "-q/--quiet"),
         // No equivalent
         (args.pretty.is_some(), "--pretty"),
         // No equivalent
@@ -133,7 +131,18 @@ pub fn translate(args: Cli) -> Result<Command> {
         // Far from an exact match, but it does print the request headers
         cmd.opt("-v", "--verbose");
     }
-    if args.stream {
+    if args.quiet > 0 {
+        // Also not an exact match but it suppresses error messages which
+        // is sorta like suppressing warnings
+        cmd.opt("-s", "--silent");
+    }
+    if args.debug {
+        // Again not an exact match but it's something
+        // This actually overrides --verbose
+        cmd.arg("--trace");
+        cmd.arg("-");
+    }
+    if args.stream == Some(true) {
         // curl sorta streams by default, but its buffer stops it from
         // showing up right away
         cmd.opt("-N", "--no-buffer");
@@ -308,7 +317,7 @@ pub fn translate(args: Cli) -> Result<Command> {
         if value.is_empty() {
             cmd.arg(format!("{};", header));
         } else {
-            cmd.arg(format!("{}: {}", header, value.to_str()?));
+            cmd.arg(format!("{}: {}", header, value.to_utf8_str()?));
         }
     }
     for header in headers_to_unset {
@@ -544,6 +553,10 @@ mod tests {
             (
                 "xh http://example.com/[1-100].png?q={80,90}",
                 "curl -g 'http://example.com/[1-100].png?q={80,90}'",
+            ),
+            (
+                "xh https://exmaple.com/ hello:你好",
+                "curl https://exmaple.com/ -H 'hello: 你好'"
             )
         ];
         for (input, output) in expected {

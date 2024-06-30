@@ -4,12 +4,14 @@ use std::str::FromStr;
 use brotli::Decompressor as BrotliDecoder;
 use flate2::read::{GzDecoder, ZlibDecoder};
 use reqwest::header::{HeaderMap, CONTENT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING};
+use ruzstd::{FrameDecoder, StreamingDecoder as ZstdDecoder};
 
 #[derive(Debug)]
 pub enum CompressionType {
     Gzip,
     Deflate,
     Brotli,
+    Zstd,
 }
 
 impl FromStr for CompressionType {
@@ -19,6 +21,7 @@ impl FromStr for CompressionType {
             "gzip" => Ok(CompressionType::Gzip),
             "deflate" => Ok(CompressionType::Deflate),
             "br" => Ok(CompressionType::Brotli),
+            "zstd" => Ok(CompressionType::Zstd),
             _ => Err(anyhow::anyhow!("unknown compression type")),
         }
     }
@@ -67,6 +70,7 @@ impl<R: Read> InnerReader<R> {
 
 impl<R: Read> Read for InnerReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.has_errored = false;
         match self.reader.read(buf) {
             Ok(0) => Ok(0),
             Ok(len) => {
@@ -87,6 +91,7 @@ enum Decoder<R: Read> {
     Gzip(GzDecoder<InnerReader<R>>),
     Deflate(ZlibDecoder<InnerReader<R>>),
     Brotli(BrotliDecoder<InnerReader<R>>),
+    Zstd(ZstdDecoder<InnerReader<R>, FrameDecoder>),
 }
 
 impl<R: Read> Read for Decoder<R> {
@@ -120,6 +125,15 @@ impl<R: Read> Read for Decoder<R> {
                     format!("error decoding brotli response body: {}", e),
                 )),
             },
+            Decoder::Zstd(decoder) => match decoder.read(buf) {
+                Ok(n) => Ok(n),
+                Err(e) if decoder.get_ref().has_errored => Err(e),
+                Err(_) if !decoder.get_ref().has_read_data => Ok(0),
+                Err(e) => Err(io::Error::new(
+                    e.kind(),
+                    format!("error decoding zstd response body: {}", e),
+                )),
+            },
         }
     }
 }
@@ -133,6 +147,7 @@ pub fn decompress(
         Some(CompressionType::Gzip) => Decoder::Gzip(GzDecoder::new(reader)),
         Some(CompressionType::Deflate) => Decoder::Deflate(ZlibDecoder::new(reader)),
         Some(CompressionType::Brotli) => Decoder::Brotli(BrotliDecoder::new(reader, 4096)),
+        Some(CompressionType::Zstd) => Decoder::Zstd(ZstdDecoder::new(reader).unwrap()),
         None => Decoder::PlainText(reader),
     }
 }
@@ -175,5 +190,28 @@ mod tests {
                 assert!(e.to_string().starts_with("oh no!"))
             }
         }
+    }
+
+    #[test]
+    fn interrupts_are_handled_gracefully() {
+        struct InterruptedReader {
+            init: bool,
+        }
+        impl Read for InterruptedReader {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                if !self.init {
+                    self.init = true;
+                    Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted"))
+                } else {
+                    Ok(0)
+                }
+            }
+        }
+
+        let mut base_reader = InterruptedReader { init: false };
+        let mut reader = decompress(&mut base_reader, Some(CompressionType::Gzip));
+        let mut buffer = Vec::new();
+        reader.read_to_end(&mut buffer).unwrap();
+        assert_eq!(buffer, b"");
     }
 }

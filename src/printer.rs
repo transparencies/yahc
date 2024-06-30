@@ -13,11 +13,12 @@ use reqwest::header::{
 use reqwest::Version;
 use url::Url;
 
-use crate::cli::FormatOptions;
-use crate::decoder::{decompress, get_compression_type};
 use crate::{
     buffer::Buffer,
+    cli::FormatOptions,
     cli::{Pretty, Theme},
+    decoder::{decompress, get_compression_type},
+    formatting::serde_json_format,
     formatting::{get_json_formatter, Highlighter},
     middleware::ResponseExt,
     utils::{copy_largebuf, test_mode, BUFFER_SIZE},
@@ -114,7 +115,7 @@ pub struct Printer {
     sort_headers: bool,
     color: bool,
     theme: Theme,
-    stream: bool,
+    stream: Option<bool>,
     buffer: Buffer,
 }
 
@@ -122,7 +123,7 @@ impl Printer {
     pub fn new(
         pretty: Pretty,
         theme: Theme,
-        stream: bool,
+        stream: impl Into<Option<bool>>,
         buffer: Buffer,
         format_options: FormatOptions,
     ) -> Self {
@@ -131,7 +132,7 @@ impl Printer {
             json_indent_level: format_options.json_indent.unwrap_or(4),
             sort_headers: format_options.headers_sort.unwrap_or(pretty.format()),
             color: pretty.color(),
-            stream,
+            stream: stream.into(),
             theme,
             buffer,
         }
@@ -166,16 +167,19 @@ impl Printer {
             return self.print_syntax_text(text, "json");
         }
 
-        let mut formatter = get_json_formatter(self.json_indent_level);
         if self.color {
             let mut buf = Vec::new();
-            formatter.format_buf(text.as_bytes(), &mut buf)?;
+            serde_json_format(self.json_indent_level, text, &mut buf)?;
+            buf.write_all(&[b'\n', b'\n'])?;
             // in principle, buf should already be valid UTF-8,
             // because JSONXF doesn't mangle it
             let text = String::from_utf8_lossy(&buf);
             self.print_colorized_text(&text, "json")
         } else {
-            formatter.format_buf(text.as_bytes(), &mut self.buffer)
+            serde_json_format(self.json_indent_level, text, &mut self.buffer)?;
+            self.buffer.write_all(&[b'\n', b'\n'])?;
+            self.buffer.flush()?;
+            Ok(())
         }
     }
 
@@ -447,6 +451,9 @@ impl Printer {
         let compression_type = get_compression_type(response.headers());
         let mut body = decompress(response, compression_type);
 
+        // Automatically activate stream mode when it hasn't been set by the user and the content type is stream
+        let stream = self.stream.unwrap_or(content_type.is_stream());
+
         if !self.buffer.is_terminal() {
             if (self.color || self.format_json) && content_type.is_text() {
                 // The user explicitly asked for formatting even though this is
@@ -461,7 +468,7 @@ impl Printer {
                 // force UTF-8 output without coloring or formatting
                 // Unconditionally decoding is not an option because the body
                 // might not be text at all
-                if self.stream {
+                if stream {
                     self.print_body_stream(
                         content_type,
                         &mut decode_stream(&mut body, encoding, &url)?,
@@ -472,14 +479,14 @@ impl Printer {
                     let text = decode_blob_unconditional(&buf, encoding, &url);
                     self.print_body_text(content_type, &text)?;
                 }
-            } else if self.stream {
+            } else if stream {
                 copy_largebuf(&mut body, &mut self.buffer, true)?;
             } else {
                 let mut buf = Vec::new();
                 body.read_to_end(&mut buf)?;
                 self.buffer.print(&buf)?;
             }
-        } else if self.stream {
+        } else if stream {
             match self
                 .print_body_stream(content_type, &mut decode_stream(&mut body, encoding, &url)?)
             {
@@ -538,15 +545,36 @@ enum ContentType {
     Text,
     UrlencodedForm,
     Multipart,
+    EventStream,
     Unknown,
 }
 
 impl ContentType {
     fn is_text(&self) -> bool {
-        !matches!(
-            self,
-            ContentType::Unknown | ContentType::UrlencodedForm | ContentType::Multipart
-        )
+        match self {
+            ContentType::Unknown | ContentType::UrlencodedForm | ContentType::Multipart => false,
+            ContentType::Json
+            | ContentType::Html
+            | ContentType::Xml
+            | ContentType::JavaScript
+            | ContentType::Css
+            | ContentType::Text
+            | ContentType::EventStream => true,
+        }
+    }
+    fn is_stream(&self) -> bool {
+        match self {
+            ContentType::EventStream => true,
+            ContentType::Json
+            | ContentType::Html
+            | ContentType::Xml
+            | ContentType::JavaScript
+            | ContentType::Css
+            | ContentType::Text
+            | ContentType::UrlencodedForm
+            | ContentType::Multipart
+            | ContentType::Unknown => false,
+        }
     }
 }
 
@@ -566,6 +594,8 @@ impl From<&str> for ContentType {
             ContentType::JavaScript
         } else if content_type.contains("css") {
             ContentType::Css
+        } else if content_type.contains("event-stream") {
+            ContentType::EventStream
         } else if content_type.contains("text") {
             // We later check if this one's JSON
             // HTTPie checks for "json", "javascript" and "text" in one place:
@@ -723,9 +753,10 @@ fn get_charset(response: &Response) -> Option<&'static Encoding> {
 mod tests {
     use indoc::indoc;
 
-    use super::*;
     use crate::utils::random_string;
     use crate::{buffer::Buffer, cli::Cli, vec_of_strings};
+
+    use super::*;
 
     fn run_cmd(args: impl IntoIterator<Item = String>, is_stdout_tty: bool) -> Printer {
         let args = Cli::try_parse_from(args).unwrap();
@@ -819,7 +850,7 @@ mod tests {
             sort_headers: false,
             color: false,
             theme: Theme::Auto,
-            stream: false,
+            stream: false.into(),
             buffer: Buffer::new(false, None, false).unwrap(),
         };
 

@@ -18,6 +18,7 @@ use reqwest::{tls, Method, Url};
 use serde::Deserialize;
 
 use crate::buffer::Buffer;
+use crate::redacted::SecretString;
 use crate::request_items::RequestItems;
 use crate::utils::config_dir;
 
@@ -155,6 +156,14 @@ Example: --print=Hb"
     #[clap(short = 'v', long, action = ArgAction::Count)]
     pub verbose: u8,
 
+    /// Print full error stack traces and debug log messages.
+    ///
+    /// Logging can be configured in more detail using the `$RUST_LOG` environment
+    /// variable. Set `RUST_LOG=trace` to show even more messages.
+    /// See https://docs.rs/env_logger/0.11.3/env_logger/#enabling-logging.
+    #[clap(long)]
+    pub debug: bool,
+
     /// Show any intermediary requests/responses while following redirects with --follow.
     #[clap(long)]
     pub all: bool,
@@ -164,12 +173,15 @@ Example: --print=Hb"
     pub history_print: Option<Print>,
 
     /// Do not print to stdout or stderr.
-    #[clap(short = 'q', long)]
-    pub quiet: bool,
+    #[clap(short = 'q', long, action = ArgAction::Count)]
+    pub quiet: u8,
 
     /// Always stream the response body.
-    #[clap(short = 'S', long)]
-    pub stream: bool,
+    #[clap(short = 'S', long = "stream", name = "stream")]
+    pub stream_raw: bool,
+
+    #[clap(skip)]
+    pub stream: Option<bool>,
 
     /// Save output to FILE instead of stdout.
     #[clap(short = 'o', long, value_name = "FILE")]
@@ -216,11 +228,11 @@ Example: --print=Hb"
     ///
     /// TOKEN is expected if --auth-type=bearer.
     #[clap(short = 'a', long, value_name = "USER[:PASS] | TOKEN")]
-    pub auth: Option<String>,
+    pub auth: Option<SecretString>,
 
     /// Authenticate with a bearer token.
     #[clap(long, value_name = "TOKEN", hide = true)]
-    pub bearer: Option<String>,
+    pub bearer: Option<SecretString>,
 
     /// Do not use credentials from .netrc
     #[clap(long)]
@@ -391,7 +403,7 @@ Example: --print=Hb"
     ///
     ///         To set the filename and mimetype, ";type=" and
     ///         ";filename=" can be used respectively.
-    ///         
+    ///
     ///         Example: "pfp@ra.jpg;type=image/jpeg;filename=profile.jpg"
     ///
     ///     @filename
@@ -503,11 +515,10 @@ impl Cli {
             );
         }
 
-        cli.bin_name = app
-            .get_bin_name()
+        app.get_bin_name()
             .and_then(|name| name.split('.').next())
             .unwrap_or("xh")
-            .to_owned();
+            .clone_into(&mut cli.bin_name);
 
         if matches!(cli.bin_name.as_str(), "https" | "xhs" | "xhttps") {
             cli.https = true;
@@ -550,6 +561,12 @@ impl Cli {
             self.auth = self.bearer.take();
         }
         self.check_status = match (self.check_status_raw, matches.get_flag("no-check-status")) {
+            (true, true) => unreachable!(),
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            (false, false) => None,
+        };
+        self.stream = match (self.stream_raw, matches.get_flag("no-stream")) {
             (true, true) => unreachable!(),
             (true, false) => Some(true),
             (false, true) => Some(false),
@@ -610,6 +627,51 @@ impl Cli {
             .after_help(format!("Each option can be reset with a --no-OPTION argument.\n\nRun \"{} help\" for more complete documentation.", env!("CARGO_PKG_NAME")))
             .after_long_help("Each option can be reset with a --no-OPTION argument.")
     }
+
+    pub fn logger_config(&self) -> env_logger::Builder {
+        if self.debug || std::env::var_os("RUST_LOG").is_some() {
+            let env = env_logger::Env::default().default_filter_or("debug");
+            let mut builder = env_logger::Builder::from_env(env);
+
+            let start = std::time::Instant::now();
+            builder.format(move |buf, record| {
+                let time = start.elapsed().as_secs_f64();
+                let level = record.level();
+                let style = buf.default_level_style(level);
+                let module = record.module_path().unwrap_or("");
+                let args = record.args();
+                writeln!(
+                    buf,
+                    "[{time:.6}s {style}{level: <5}{style:#} {module}] {args}"
+                )
+            });
+
+            builder
+        } else {
+            let env = env_logger::Env::default();
+            let mut builder = env_logger::Builder::from_env(env);
+            if self.quiet >= 2 {
+                builder.filter_level(log::LevelFilter::Error);
+            } else {
+                builder.filter_level(log::LevelFilter::Warn);
+            }
+
+            let bin_name = self.bin_name.clone();
+            builder.format(move |buf, record| {
+                let level = match record.level() {
+                    log::Level::Error => "error",
+                    log::Level::Warn => "warning",
+                    log::Level::Info => "info",
+                    log::Level::Debug => "debug",
+                    log::Level::Trace => "trace",
+                };
+                let args = record.args();
+                writeln!(buf, "{bin_name}: {level}: {args}")
+            });
+
+            builder
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -622,6 +684,7 @@ fn default_cli_args() -> Option<Vec<String>> {
         Ok(file) => Some(file),
         Err(err) => {
             if err.kind() != std::io::ErrorKind::NotFound {
+                // Can't use log::warn!() because logging isn't initialized yet
                 eprintln!(
                     "\n{}: warning: Unable to read config file: {}\n",
                     env!("CARGO_PKG_NAME"),
@@ -1689,6 +1752,24 @@ mod tests {
 
         let cli = parse(["--no-check-status", "--check-status", ":"]).unwrap();
         assert_eq!(cli.check_status, Some(true));
+    }
+
+    #[test]
+    fn negating_stream() {
+        let cli = parse([":"]).unwrap();
+        assert_eq!(cli.stream, None);
+
+        let cli = parse(["--stream", ":"]).unwrap();
+        assert_eq!(cli.stream, Some(true));
+
+        let cli = parse(["--no-stream", ":"]).unwrap();
+        assert_eq!(cli.stream, Some(false));
+
+        let cli = parse(["--stream", "--no-stream", ":"]).unwrap();
+        assert_eq!(cli.stream, Some(false));
+
+        let cli = parse(["--no-stream", "--stream", ":"]).unwrap();
+        assert_eq!(cli.stream, Some(true));
     }
 
     #[test]
