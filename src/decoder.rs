@@ -1,12 +1,14 @@
 use std::cell::Cell;
-use std::io::{self, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::rc::Rc;
 use std::str::FromStr;
 
 use brotli::Decompressor as BrotliDecoder;
 use flate2::read::{GzDecoder, ZlibDecoder};
 use reqwest::header::{CONTENT_ENCODING, CONTENT_LENGTH, HeaderMap, TRANSFER_ENCODING};
-use ruzstd::{FrameDecoder, StreamingDecoder as ZstdDecoder};
+use ruzstd::frame::ReadFrameHeaderError;
+use ruzstd::frame_decoder::FrameDecoderError;
+use ruzstd::{BlockDecodingStrategy, FrameDecoder};
 
 #[derive(Debug, Clone, Copy)]
 pub enum CompressionType {
@@ -137,11 +139,9 @@ impl<R: Read> Read for InnerReader<R> {
                 // Store the real error and return a placeholder.
                 // The placeholder is intercepted and replaced by the real error
                 // before leaving this module.
-                // We store the whole error instead of setting a flag because of zstd:
-                // - ZstdDecoder::new() fails with a custom error type and it's hard
-                //   to extract the underlying io::Error
-                // - ZstdDecoder::read() (unlike the other decoders) wraps custom errors
-                //   around the underlying io::Error
+                // We store the whole error instead of setting a flag because ruzstd
+                // wraps I/O errors in custom errors during frame initialization and
+                // decoding, making the original io::Error hard to recover.
                 let msg = err.to_string();
                 let kind = err.kind();
                 self.status.read_error.set(Some(err));
@@ -200,37 +200,93 @@ pub fn decompress(
             CompressionType::Deflate => Box::new(ZlibDecoder::new(reader)),
             // 32K is the default buffer size for gzip and deflate
             CompressionType::Brotli => Box::new(BrotliDecoder::new(reader, 32 * 1024)),
-            CompressionType::Zstd => Box::new(LazyZstdDecoder::Uninit(Some(reader))),
+            CompressionType::Zstd => Box::new(LazyZstdDecoder::new(reader)),
         },
         status: Some(status),
     }
 }
 
-/// [ZstdDecoder] reads from its input during construction.
+/// A lazy decoder for a stream containing any number of zstd frames.
 ///
-/// We need to delay construction until [Read] so read errors stay read errors.
-#[allow(clippy::large_enum_variant)]
-enum LazyZstdDecoder<R: Read> {
-    Uninit(Option<R>),
-    Init(ZstdDecoder<R, FrameDecoder>),
+/// ruzstd's high-level streaming decoder reads during construction and stops
+/// after one frame. Using [FrameDecoder] directly lets us defer all reads until
+/// [Read] and continue through concatenated and skippable frames.
+struct LazyZstdDecoder<R: Read> {
+    reader: BufReader<R>,
+    decoder: FrameDecoder,
+    state: ZstdDecoderState,
+}
+
+#[derive(Clone, Copy)]
+enum ZstdDecoderState {
+    NeedFrame,
+    Decoding,
+    Finished,
+}
+
+impl<R: Read> LazyZstdDecoder<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader: BufReader::new(reader),
+            decoder: FrameDecoder::new(),
+            state: ZstdDecoderState::NeedFrame,
+        }
+    }
 }
 
 impl<R: Read> Read for LazyZstdDecoder<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            LazyZstdDecoder::Uninit(reader) => match reader.take() {
-                Some(reader) => match ZstdDecoder::new(reader) {
-                    Ok(decoder) => {
-                        *self = LazyZstdDecoder::Init(decoder);
-                        self.read(buf)
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            match self.state {
+                ZstdDecoderState::NeedFrame => {
+                    if self.reader.fill_buf()?.is_empty() {
+                        self.state = ZstdDecoderState::Finished;
+                        return Ok(0);
                     }
-                    Err(err) => Err(io::Error::other(err)),
-                },
-                // We seem to get here in --stream mode because another layer tries
-                // to read again after Ok(0).
-                None => Err(io::Error::other("failed to construct ZstdDecoder")),
-            },
-            LazyZstdDecoder::Init(streaming_decoder) => streaming_decoder.read(buf),
+
+                    match self.decoder.reset(&mut self.reader) {
+                        Ok(()) => self.state = ZstdDecoderState::Decoding,
+                        Err(FrameDecoderError::ReadFrameHeaderError(
+                            ReadFrameHeaderError::SkipFrame { length, .. },
+                        )) => {
+                            let length = u64::from(length);
+                            let copied = {
+                                let mut payload = self.reader.by_ref().take(length);
+                                io::copy(&mut payload, &mut io::sink())?
+                            };
+                            if copied != length {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    "truncated zstd skippable frame",
+                                ));
+                            }
+                        }
+                        Err(err) => return Err(io::Error::other(err)),
+                    }
+                }
+                ZstdDecoderState::Decoding => {
+                    while self.decoder.can_collect() < buf.len() && !self.decoder.is_finished() {
+                        let additional_bytes = buf.len() - self.decoder.can_collect();
+                        self.decoder
+                            .decode_blocks(
+                                &mut self.reader,
+                                BlockDecodingStrategy::UptoBytes(additional_bytes),
+                            )
+                            .map_err(io::Error::other)?;
+                    }
+
+                    let read = self.decoder.read(buf)?;
+                    if read != 0 {
+                        return Ok(read);
+                    }
+                    self.state = ZstdDecoderState::NeedFrame;
+                }
+                ZstdDecoderState::Finished => return Ok(0),
+            }
         }
     }
 }
@@ -336,6 +392,69 @@ mod tests {
                 assert_eq!(buf, b"");
             }
         }
+    }
+
+    #[test]
+    fn zstd_decodes_concatenated_and_skippable_frames() {
+        let frame = include_bytes!("../tests/fixtures/responses/hello_world.zst");
+        let skipped = b"not compressed";
+        let mut input = Vec::new();
+        input.extend_from_slice(frame);
+        input.extend_from_slice(&0x184d_2a50_u32.to_le_bytes());
+        input.extend_from_slice(&(skipped.len() as u32).to_le_bytes());
+        input.extend_from_slice(skipped);
+        input.extend_from_slice(frame);
+
+        let mut input = input.as_slice();
+        let mut reader = decompress(&mut input, Some(CompressionType::Zstd));
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        assert_eq!(output, b"Hello world\nHello world\n");
+
+        // Must accept repeated read attempts after the last frame.
+        for _ in 0..10 {
+            assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn zstd_rejects_truncated_following_frames() {
+        let frame = include_bytes!("../tests/fixtures/responses/hello_world.zst");
+        let truncated_magic_number = [0x28, 0xb5, 0x2f];
+
+        // The second case includes a complete frame and block header, but only
+        // the first byte of the block payload.
+        for truncated_frame in [truncated_magic_number.as_slice(), &frame[..10]] {
+            let mut input = Vec::from(frame.as_slice());
+            input.extend_from_slice(truncated_frame);
+
+            let mut input = input.as_slice();
+            let mut reader = decompress(&mut input, Some(CompressionType::Zstd));
+            let mut output = Vec::new();
+            let err = reader.read_to_end(&mut output).unwrap_err();
+
+            assert_eq!(output, b"Hello world\n");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(err.to_string(), "error decoding zstd response body");
+        }
+    }
+
+    #[test]
+    fn zstd_rejects_a_truncated_skippable_frame() {
+        let frame = include_bytes!("../tests/fixtures/responses/hello_world.zst");
+        let mut input = Vec::from(frame.as_slice());
+        input.extend_from_slice(&0x184d_2a50_u32.to_le_bytes());
+        input.extend_from_slice(&10_u32.to_le_bytes());
+        input.extend_from_slice(b"short");
+
+        let mut input = input.as_slice();
+        let mut reader = decompress(&mut input, Some(CompressionType::Zstd));
+        let mut output = Vec::new();
+        let err = reader.read_to_end(&mut output).unwrap_err();
+
+        assert_eq!(output, b"Hello world\n");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "error decoding zstd response body");
     }
 
     #[test]
