@@ -3583,6 +3583,33 @@ fn zstd() {
 }
 
 #[test]
+fn zstd_concatenated_frames() {
+    let server = server::http(|_req| async move {
+        let frame = fs::read("./tests/fixtures/responses/hello_world.zst").unwrap();
+        let compressed_bytes = [frame.as_slice(), frame.as_slice()].concat();
+        hyper::Response::builder()
+            .header("date", "N/A")
+            .header("content-encoding", "zstd")
+            .body(compressed_bytes.into())
+            .unwrap()
+    });
+
+    get_command()
+        .arg(server.base_url())
+        .assert()
+        .stdout(indoc! {r#"
+            HTTP/1.1 200 OK
+            Content-Encoding: zstd
+            Content-Length: 50
+            Date: N/A
+
+            Hello world
+            Hello world
+
+        "#});
+}
+
+#[test]
 fn empty_response_with_content_encoding() {
     let server = server::http(|_req| async move {
         hyper::Response::builder()
